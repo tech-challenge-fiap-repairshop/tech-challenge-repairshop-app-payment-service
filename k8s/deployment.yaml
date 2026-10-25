@@ -6,15 +6,21 @@ metadata:
   labels:
     app: payment-service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: payment-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         app: payment-service
     spec:
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -39,17 +45,32 @@ spec:
               value: "payment-service"
             - name: OTEL_TRACES_EXPORTER
               value: "otlp"
+            - name: OTEL_METRICS_EXPORTER
+              value: "otlp"
+            - name: OTEL_LOGS_EXPORTER
+              value: "otlp"
+            - name: OTEL_INSTRUMENTATION_LOGBACK_APPENDER_ENABLED
+              value: "true"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://otel-collector:4317"
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
               value: "grpc"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.name=payment-service,deployment.environment=production"
+          envFrom:
+            - configMapRef:
+                name: payment-service-config
+            - secretRef:
+                name: payment-service-secret
           resources:
             requests:
               cpu: 100m
               memory: 256Mi
+              ephemeral-storage: "1Gi"
             limits:
               cpu: 500m
               memory: 512Mi
+              ephemeral-storage: "2Gi"
           volumeMounts:
             - name: tmp-volume
               mountPath: /tmp

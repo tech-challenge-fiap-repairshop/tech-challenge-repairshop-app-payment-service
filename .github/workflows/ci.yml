@@ -1,0 +1,387 @@
+name: 🚀 Payment Service CI/CD Pipeline
+
+on:
+  push:
+    branches: [ 'main', 'homolog', 'develop' ]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - 'Dockerfile'
+      - 'k8s/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [ 'main', 'homolog', 'develop' ]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - 'Dockerfile'
+      - 'k8s/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Ambiente de Deploy (dev, hml, prd)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - hml
+          - prd
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '24'
+  JAVA_DISTRIBUTION: 'temurin'
+  AWS_REGION: 'us-east-1'
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+
+jobs:
+  # ==========================================================================
+  # STAGE 1 — BUILD: Compila o projeto, empacota e realiza teste de fumaça
+  # ==========================================================================
+  build:
+    name: "🏗️ Build & Smoke Test"
+    if: |
+      !contains(github.event.head_commit.message, '[skip-ci]') &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[ci skip]') &&
+      !contains(github.event.pull_request.title, '[skip-ci]') &&
+      !contains(github.event.pull_request.title, '[skip ci]') &&
+      !contains(github.event.pull_request.title, '[ci skip]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Compile project (skip tests)
+        run: mvn clean compile -B -ntp -DskipTests
+
+      - name: Package application (skip tests)
+        run: mvn package -B -ntp -DskipTests
+
+      - name: Run Application JAR
+        env:
+          SERVER_PORT: "8082"
+          SQS_HEALTH_CHECK_ENABLED: "false"
+          AWS_REGION: "us-east-1"
+          JAVA_TOOL_OPTIONS: "-Djava.net.preferIPv4Stack=true"
+        run: |
+          docker run -d --name smoke-jar --network host \
+            -v ${{ github.workspace }}:/app \
+            -w /app \
+            -e SERVER_PORT="$SERVER_PORT" \
+            -e SQS_HEALTH_CHECK_ENABLED="$SQS_HEALTH_CHECK_ENABLED" \
+            -e AWS_REGION="$AWS_REGION" \
+            -e JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS" \
+            eclipse-temurin:24-jre java -jar target/payment-service-0.0.1-SNAPSHOT.jar
+
+      - name: Verify application startup (Actuator Health Check)
+        run: |
+          echo "Waiting for application to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8082/actuator/health | grep -q '"status":"UP"'; then
+              echo "Post-Build Smoke Test Passed! Application is UP."
+              docker stop smoke-jar
+              docker rm smoke-jar
+              exit 0
+            fi
+            echo "Waiting..."
+            sleep 2
+          done
+          echo "Post-Build Smoke Test Failed! Application log output:"
+          docker logs smoke-jar
+          docker stop smoke-jar
+          docker rm smoke-jar
+          exit 1
+
+  # ==========================================================================
+  # STAGE 2 — TEST: Testes unitários + integração + JaCoCo
+  # ==========================================================================
+  test:
+    name: "🧪 Test"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Run tests and generate JaCoCo report
+        run: mvn clean verify -B -ntp
+        env:
+          SPRING_PROFILES_ACTIVE: test
+
+      - name: Upload JaCoCo coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            target/site/jacoco/
+            target/jacoco.exec
+          retention-days: 1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: target/surefire-reports/
+          retention-days: 1
+
+  # ==========================================================================
+  # STAGE 3 — QUALITY GATE: SonarCloud analysis
+  # ==========================================================================
+  quality:
+    name: "🔍 Quality Gate (SonarCloud)"
+    needs: test
+    if: |
+      needs.test.result == 'success' &&
+      ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog') ||
+       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: target/
+
+      - name: SonarCloud Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "⚠️ SONAR_TOKEN secret não configurada. Ignorando análise do SonarCloud."
+            exit 0
+          fi
+          mvn -B -ntp sonar:sonar \
+            -Dsonar.projectKey=alexandre-agamin_repairshop-payment-service \
+            -Dsonar.organization=alexandre-agamin \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.kotlin.binaries=target/classes
+
+  # ==========================================================================
+  # STAGE 4 — CONTAINER & SECURITY: Build Docker, Scan Trivy e Push (ECR)
+  # ==========================================================================
+  docker-build-push:
+    name: "🐳 Docker Build & Trivy Scan"
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Determine Target Environment & ECR Repository
+        id: ecr-target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET="${{ github.event.inputs.target_env }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TARGET="prd"
+          elif [ "${{ github.ref }}" = "refs/heads/homolog" ]; then
+            TARGET="hml"
+          else
+            TARGET="dev"
+          fi
+          
+          REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service') && contains(repositoryName, '${TARGET}')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
+          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
+            REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
+          fi
+          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
+            REPO_NAME="payment-service-${TARGET}"
+          fi
+          echo "target_env=${TARGET}" >> $GITHUB_OUTPUT
+          echo "repository_name=${REPO_NAME}" >> $GITHUB_OUTPUT
+          echo "Target Environment: ${TARGET}"
+          echo "ECR Repository Name: ${REPO_NAME}"
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Docker image to Amazon ECR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch'
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:${{ github.sha }}
+
+  # ==========================================================================
+  # STAGE 5 — APPROVAL: Aprovação Manual para Deploy em Produção (Main)
+  # ==========================================================================
+  approve-deploy:
+    name: "⏳ Approve Deployment"
+    needs: [docker-build-push]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Manual Approval (Produção apenas)
+        if: github.ref == 'refs/heads/main'
+        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ github.actor }}
+          minimum-approvals: 1
+          issue-title: "Deploying Payment Service to Production (EKS)"
+          issue-body: "Please approve or deny the deployment of version ${{ github.sha }} to AWS EKS."
+
+  # ==========================================================================
+  # STAGE 6 — DEPLOY: Deploy no Kubernetes EKS
+  # ==========================================================================
+  deploy:
+    name: "🚀 Deploy to EKS"
+    needs: approve-deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine Target Environment
+        id: env-target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET="${{ github.event.inputs.target_env }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TARGET="prd"
+          elif [ "${{ github.ref }}" = "refs/heads/homolog" ]; then
+            TARGET="hml"
+          else
+            TARGET="dev"
+          fi
+          echo "environment=${TARGET}" >> $GITHUB_OUTPUT
+          echo "cluster_name=repairshop-eks-${TARGET}" >> $GITHUB_OUTPUT
+          echo "Target Environment: ${TARGET}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Kubeconfig from EKS
+        run: |
+          CLUSTER="${{ steps.env-target.outputs.cluster_name }}"
+          echo "Configuring Kubeconfig for cluster: $CLUSTER..."
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name "$CLUSTER"
+
+      - name: Prepare Deployment & Secrets
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          ENV_NAME="${{ steps.env-target.outputs.environment }}"
+          
+          REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service') && contains(repositoryName, '${ENV_NAME}')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
+          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
+            REPO_NAME="payment-service-${ENV_NAME}"
+          fi
+          
+          echo "Using Image: ${ECR_REGISTRY}/${REPO_NAME}:latest"
+          sed -i "s|image: .*|image: ${ECR_REGISTRY}/${REPO_NAME}:latest|g" k8s/deployment.yaml
+
+      - name: Deploy Kubernetes Manifests
+        run: |
+          ENV_NAME="${{ steps.env-target.outputs.environment }}"
+          
+          echo "Garantindo namespace 'repairshop'..."
+          kubectl apply -f k8s/namespace.yaml
+          
+          echo "Aplicando ConfigMap (${ENV_NAME})..."
+          kubectl apply -f "k8s/configmap/configmap-${ENV_NAME}.yaml"
+          
+          echo "Aplicando Secret..."
+          kubectl apply -f k8s/secret.yaml
+          
+          echo "Aplicando Service..."
+          kubectl apply -f k8s/service.yaml
+          
+          echo "Aplicando Deployment..."
+          kubectl apply -f k8s/deployment.yaml
+          
+          echo "Aplicando HPA..."
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Wait for Deployment Rollout
+        run: |
+          echo "Aguardando rollout do payment-service..."
+          kubectl rollout status deployment/payment-service -n repairshop --timeout=5m
