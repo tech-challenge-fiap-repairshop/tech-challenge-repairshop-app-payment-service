@@ -8,6 +8,7 @@ on:
       - 'pom.xml'
       - 'Dockerfile'
       - 'k8s/**'
+      - 'sonar-project.properties'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [ 'main', 'homolog', 'develop' ]
@@ -16,6 +17,7 @@ on:
       - 'pom.xml'
       - 'Dockerfile'
       - 'k8s/**'
+      - 'sonar-project.properties'
       - '.github/workflows/ci.yml'
   workflow_dispatch:
     inputs:
@@ -160,8 +162,8 @@ jobs:
     needs: test
     if: |
       needs.test.result == 'success' &&
-      ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog') ||
-       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -194,7 +196,7 @@ jobs:
             exit 0
           fi
           mvn -B -ntp sonar:sonar \
-            -Dsonar.projectKey=alexandre-agamin_repairshop-payment-service \
+            -Dsonar.projectKey=alexandre-agamin_tech-challenge-repairshop-app-payment-service \
             -Dsonar.organization=alexandre-agamin \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token="$SONAR_TOKEN" \
@@ -207,8 +209,11 @@ jobs:
   # ==========================================================================
   docker-build-push:
     name: "🐳 Docker Build & Trivy Scan"
-    needs: test
-    if: needs.test.result == 'success'
+    needs: [test, quality]
+    if: |
+      needs.quality.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -275,39 +280,20 @@ jobs:
           severity: 'CRITICAL,HIGH'
 
       - name: Push Docker image to Amazon ECR
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch'
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:${{ github.sha }}
 
   # ==========================================================================
-  # STAGE 5 — APPROVAL: Aprovação Manual para Deploy em Produção (Main)
-  # ==========================================================================
-  approve-deploy:
-    name: "⏳ Approve Deployment"
-    needs: [docker-build-push]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      contents: read
-    steps:
-      - name: Manual Approval (Produção apenas)
-        if: github.ref == 'refs/heads/main'
-        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367
-        with:
-          secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: ${{ github.actor }}
-          minimum-approvals: 1
-          issue-title: "Deploying Payment Service to Production (EKS)"
-          issue-body: "Please approve or deny the deployment of version ${{ github.sha }} to AWS EKS."
-
-  # ==========================================================================
-  # STAGE 6 — DEPLOY: Deploy no Kubernetes EKS
+  # STAGE 5 — DEPLOY: Deploy no Kubernetes EKS (Direto pós-merge na Main)
   # ==========================================================================
   deploy:
     name: "🚀 Deploy to EKS"
-    needs: approve-deploy
+    needs: [docker-build-push]
+    if: |
+      needs.docker-build-push.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target_env == 'prd'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
