@@ -6,23 +6,22 @@ import br.com.fiap.repairshop.payment.infrastructure.persistence.PaymentDynamoIt
 import br.com.fiap.repairshop.payment.infrastructure.web.CreatePaymentRequest
 import br.com.fiap.repairshop.payment.infrastructure.web.PaymentController
 import br.com.fiap.repairshop.payment.infrastructure.web.WebhookNotification
+import io.mockk.*
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import org.mockito.Mockito.*
 import org.springframework.http.HttpStatus
 import java.util.UUID
 
 class PaymentControllerTest {
 
-    private lateinit var repository: DynamoPaymentRepository
-    private lateinit var messenger: PaymentSqsMessenger
+    private val repository: DynamoPaymentRepository = mockk(relaxed = true)
+    private val messenger: PaymentSqsMessenger = mockk(relaxed = true)
     private lateinit var controller: PaymentController
 
     @BeforeEach
     fun setUp() {
-        repository = mock(DynamoPaymentRepository::class.java)
-        messenger = mock(PaymentSqsMessenger::class.java)
+        clearAllMocks()
         controller = PaymentController(repository, messenger)
     }
 
@@ -32,6 +31,9 @@ class PaymentControllerTest {
         val customerId = UUID.randomUUID()
         val req = CreatePaymentRequest(orderId = orderId, customerId = customerId, amount = 150.0)
 
+        val slot = slot<PaymentDynamoItem>()
+        every { repository.save(capture(slot)) } just Runs
+
         val res = controller.createPayment(req)
 
         assertEquals(HttpStatus.CREATED, res.statusCode)
@@ -39,12 +41,13 @@ class PaymentControllerTest {
         assertEquals(orderId, res.body?.orderId)
         assertEquals(customerId, res.body?.customerId)
         assertEquals(150.0, res.body?.amount)
-        verify(repository, times(1)).save(res.body!!)
+        assertEquals("MERCADO_PAGO_QR", res.body?.paymentMethod)
+        verify(exactly = 1) { repository.save(any()) }
     }
 
     @Test
     fun `should return 404 when payment not found`() {
-        `when`(repository.findById("unknown-id")).thenReturn(null)
+        every { repository.findById("unknown-id") } returns null
 
         val res = controller.getPayment("unknown-id")
 
@@ -59,31 +62,112 @@ class PaymentControllerTest {
             customerId = UUID.randomUUID(),
             amount = 250.0
         )
-        `when`(repository.findById("pay-123")).thenReturn(item)
+        every { repository.findById("pay-123") } returns item
 
         val res = controller.getPayment("pay-123")
 
         assertEquals(HttpStatus.OK, res.statusCode)
-        assertEquals("pay-123", res.body?.id)
+        assertEquals(item, res.body)
     }
 
     @Test
-    fun `should handle webhook and confirm payment`() {
-        val orderId = UUID.randomUUID()
+    fun `should confirm payment successfully when payment exists`() {
+        val id = "pay-confirm-1"
         val item = PaymentDynamoItem(
-            id = "pay-123",
-            orderId = orderId,
+            id = id,
+            orderId = UUID.randomUUID(),
             customerId = UUID.randomUUID(),
-            amount = 200.0,
+            amount = 300.0,
             status = "PENDING"
         )
-        `when`(repository.findById("pay-123")).thenReturn(item)
+        every { repository.findById(id) } returns item
+        every { repository.updateStatus(id, "APPROVED", "DISPATCHED") } just Runs
+        every { messenger.notifyPaymentSuccess(any()) } just Runs
 
-        val webhook = WebhookNotification(id = "pay-123", status = "approved", orderId = orderId)
-        val res = controller.webhook(webhook)
+        val res = controller.confirmPayment(id)
 
         assertEquals(HttpStatus.OK, res.statusCode)
-        verify(repository).updateStatus("pay-123", "APPROVED", "DISPATCHED")
-        verify(messenger).notifyPaymentSuccess(item.copy(status = "APPROVED"))
+        assertEquals("APPROVED", res.body?.status)
+        assertEquals("DISPATCHED", res.body?.dispatchNotificateStatus)
+        verify(exactly = 1) { repository.updateStatus(id, "APPROVED", "DISPATCHED") }
+
+        val slot = slot<PaymentDynamoItem>()
+        verify(exactly = 1) { messenger.notifyPaymentSuccess(capture(slot)) }
+        assertEquals("APPROVED", slot.captured.status)
+        assertEquals("DISPATCHED", slot.captured.dispatchNotificateStatus)
+    }
+
+    @Test
+    fun `should return 404 on confirmPayment when payment does not exist`() {
+        every { repository.findById("non-existent") } returns null
+
+        val res = controller.confirmPayment("non-existent")
+
+        assertEquals(HttpStatus.NOT_FOUND, res.statusCode)
+        verify(exactly = 1) { repository.findById("non-existent") }
+        verify(exactly = 0) { repository.updateStatus(any(), any(), any()) }
+        verify(exactly = 0) { messenger.notifyPaymentSuccess(any()) }
+    }
+
+    @Test
+    fun `should process webhook with approved status and notify success`() {
+        val id = "pay-wh-approved"
+        val item = PaymentDynamoItem(
+            id = id,
+            orderId = UUID.randomUUID(),
+            customerId = UUID.randomUUID(),
+            amount = 500.0,
+            status = "PENDING"
+        )
+        every { repository.findById(id) } returns item
+        every { repository.updateStatus(id, "APPROVED", "DISPATCHED") } just Runs
+        every { messenger.notifyPaymentSuccess(any()) } just Runs
+
+        val notification = WebhookNotification(id = id, status = "approved")
+        val res = controller.webhook(notification)
+
+        assertEquals(HttpStatus.OK, res.statusCode)
+        assertEquals("processed", res.body?.get("status"))
+        verify(exactly = 1) { repository.updateStatus(id, "APPROVED", "DISPATCHED") }
+
+        val slot = slot<PaymentDynamoItem>()
+        verify(exactly = 1) { messenger.notifyPaymentSuccess(capture(slot)) }
+        assertEquals("APPROVED", slot.captured.status)
+    }
+
+    @Test
+    fun `should process webhook with rejected status without notifying success`() {
+        val id = "pay-wh-rejected"
+        val item = PaymentDynamoItem(
+            id = id,
+            orderId = UUID.randomUUID(),
+            customerId = UUID.randomUUID(),
+            amount = 500.0,
+            status = "PENDING"
+        )
+        every { repository.findById(id) } returns item
+        every { repository.updateStatus(id, "REJECTED", "DISPATCHED") } just Runs
+
+        val notification = WebhookNotification(id = id, status = "rejected")
+        val res = controller.webhook(notification)
+
+        assertEquals(HttpStatus.OK, res.statusCode)
+        assertEquals("processed", res.body?.get("status"))
+        verify(exactly = 1) { repository.updateStatus(id, "REJECTED", "DISPATCHED") }
+        verify(exactly = 0) { messenger.notifyPaymentSuccess(any()) }
+    }
+
+    @Test
+    fun `should return processed on webhook when payment not found`() {
+        every { repository.findById("unknown-webhook") } returns null
+
+        val notification = WebhookNotification(id = "unknown-webhook", status = "approved")
+        val res = controller.webhook(notification)
+
+        assertEquals(HttpStatus.OK, res.statusCode)
+        assertEquals("processed", res.body?.get("status"))
+        verify(exactly = 1) { repository.findById("unknown-webhook") }
+        verify(exactly = 0) { repository.updateStatus(any(), any(), any()) }
+        verify(exactly = 0) { messenger.notifyPaymentSuccess(any()) }
     }
 }
