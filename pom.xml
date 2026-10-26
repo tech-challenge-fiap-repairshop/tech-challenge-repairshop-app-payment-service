@@ -47,7 +47,7 @@
 		<dependency>
 			<groupId>io.opentelemetry</groupId>
 			<artifactId>opentelemetry-api</artifactId>
-			<version>1.44.1</version>
+			<version>1.47.0</version>
 		</dependency>
 		<dependency>
 			<groupId>org.springdoc</groupId>
@@ -78,11 +78,6 @@
 			<groupId>io.github.oshai</groupId>
 			<artifactId>kotlin-logging-jvm</artifactId>
 			<version>7.0.3</version>
-		</dependency>
-		<dependency>
-			<groupId>io.opentelemetry</groupId>
-			<artifactId>opentelemetry-api</artifactId>
-			<version>1.47.0</version>
 		</dependency>
 
 		<dependency>
