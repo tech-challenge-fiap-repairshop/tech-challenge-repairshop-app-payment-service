@@ -38,7 +38,7 @@ O **`payment-service`** é o microsserviço responsável pela geração de fatur
 ## 📂 Estrutura de Diretórios
 
 ```
-tech-challenge-repairshop-payment-service/
+tech-challenge-repairshop-app-payment-service/
 ├── .github/workflows/         # Pipelines de CI/CD (GitHub Actions)
 ├── k8s/                       # Manifestos Kubernetes (Deployment, Service, HPA, ConfigMap)
 ├── src/
