@@ -206,7 +206,7 @@ jobs:
     if: |
       needs.quality.result == 'success' &&
       github.event_name != 'pull_request' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/homolog' || github.event_name == 'workflow_dispatch')
+      (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target_env == 'prd'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
