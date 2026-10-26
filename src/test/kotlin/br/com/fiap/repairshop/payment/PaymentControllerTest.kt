@@ -39,7 +39,7 @@ class PaymentControllerTest {
         assertEquals(orderId, res.body?.orderId)
         assertEquals(customerId, res.body?.customerId)
         assertEquals(150.0, res.body?.amount)
-        verify(repository, times(1)).save(any(PaymentDynamoItem::class.java))
+        verify(repository, times(1)).save(res.body!!)
     }
 
     @Test
@@ -54,7 +54,7 @@ class PaymentControllerTest {
     @Test
     fun `should return payment when found`() {
         val item = PaymentDynamoItem(
-            paymentId = "pay-123",
+            id = "pay-123",
             orderId = UUID.randomUUID(),
             customerId = UUID.randomUUID(),
             amount = 250.0
@@ -64,14 +64,14 @@ class PaymentControllerTest {
         val res = controller.getPayment("pay-123")
 
         assertEquals(HttpStatus.OK, res.statusCode)
-        assertEquals("pay-123", res.body?.paymentId)
+        assertEquals("pay-123", res.body?.id)
     }
 
     @Test
     fun `should handle webhook and confirm payment`() {
         val orderId = UUID.randomUUID()
         val item = PaymentDynamoItem(
-            paymentId = "pay-123",
+            id = "pay-123",
             orderId = orderId,
             customerId = UUID.randomUUID(),
             amount = 200.0,
@@ -80,10 +80,10 @@ class PaymentControllerTest {
         `when`(repository.findById("pay-123")).thenReturn(item)
 
         val webhook = WebhookNotification(id = "pay-123", status = "approved", orderId = orderId)
-        val res = controller.receiveWebhook(webhook)
+        val res = controller.webhook(webhook)
 
         assertEquals(HttpStatus.OK, res.statusCode)
         verify(repository).updateStatus("pay-123", "APPROVED", "DISPATCHED")
-        verify(messenger).sendPaymentSuccessNotification(eq(orderId), anyString())
+        verify(messenger).notifyPaymentSuccess(item.copy(status = "APPROVED"))
     }
 }
