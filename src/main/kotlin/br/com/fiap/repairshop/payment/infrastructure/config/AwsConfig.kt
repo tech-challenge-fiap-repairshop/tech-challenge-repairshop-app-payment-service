@@ -46,6 +46,13 @@ class AwsConfig(
     }
 
     @Bean
+    fun dynamoDbEnhancedClient(dynamoDbClient: DynamoDbClient): software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient {
+        return software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient.builder()
+            .dynamoDbClient(dynamoDbClient)
+            .build()
+    }
+
+    @Bean
     fun sqsClient(): SqsClient {
         val builder = SqsClient.builder()
             .region(Region.of(region))
