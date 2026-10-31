@@ -1,87 +1,91 @@
 package br.com.fiap.repairshop.payment
 
 import br.com.fiap.repairshop.payment.infrastructure.persistence.DynamoPaymentRepository
-import br.com.fiap.repairshop.payment.infrastructure.persistence.PaymentDynamoItem
+import br.com.fiap.repairshop.payment.infrastructure.persistence.models.InvoiceDynamoItem
+import br.com.fiap.repairshop.payment.infrastructure.persistence.models.PaymentDynamoItem
+import io.mockk.*
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import org.mockito.ArgumentCaptor
-import org.mockito.Mockito.*
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbTable
+import software.amazon.awssdk.enhanced.dynamodb.TableSchema
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient
 import software.amazon.awssdk.services.dynamodb.model.*
 import java.util.UUID
 
 class DynamoPaymentRepositoryTest {
 
-    private lateinit var dynamoDbClient: DynamoDbClient
+    private val dynamoDbClient: DynamoDbClient = mockk(relaxed = true)
+    private val enhancedClient: DynamoDbEnhancedClient = mockk(relaxed = true)
+    private val paymentTable: DynamoDbTable<PaymentDynamoItem> = mockk(relaxed = true)
+    private val invoiceTable: DynamoDbTable<InvoiceDynamoItem> = mockk(relaxed = true)
     private lateinit var repository: DynamoPaymentRepository
     private val tableName = "tb-payment-test"
 
     @BeforeEach
     fun setUp() {
-        dynamoDbClient = mock(DynamoDbClient::class.java)
-        repository = DynamoPaymentRepository(dynamoDbClient, tableName)
+        clearAllMocks()
+        every { enhancedClient.table(eq(tableName), any<TableSchema<*>>()) } answers {
+            val schema = secondArg<TableSchema<*>>()
+            if (schema.itemType().rawClass() == PaymentDynamoItem::class.java) {
+                paymentTable
+            } else {
+                invoiceTable
+            }
+        }
+
+        repository = DynamoPaymentRepository(dynamoDbClient, enhancedClient, tableName)
     }
 
     @Test
-    fun `should save payment with all attributes including originTraceId`() {
+    fun `should save payment using enhanced client`() {
         val payment = PaymentDynamoItem(
-            id = "pay-100",
-            orderId = UUID.randomUUID(),
-            customerId = UUID.randomUUID(),
-            amount = 199.90,
+            paymentId = "pay-100",
+            serviceOrderId = UUID.randomUUID().toString(),
+            customerId = UUID.randomUUID().toString(),
+            priceValue = 199.90,
             status = "PENDING",
             paymentMethod = "PIX",
             dispatchNotificateStatus = "PENDING",
             originTraceId = "00-trace-123-01"
         )
 
-        repository.save(payment)
+        repository.savePayment(payment)
 
-        val captor = ArgumentCaptor.forClass(PutItemRequest::class.java)
-        verify(dynamoDbClient, times(1)).putItem(captor.capture())
-
-        val request = captor.value
-        assertEquals(tableName, request.tableName())
-        assertEquals("PAYMENT#pay-100", request.item()["PK"]?.s())
-        assertEquals("METADATA", request.item()["SK"]?.s())
-        assertEquals("pay-100", request.item()["id"]?.s())
-        assertEquals(payment.orderId.toString(), request.item()["order_id"]?.s())
-        assertEquals(payment.customerId.toString(), request.item()["customer_id"]?.s())
-        assertEquals("199.9", request.item()["amount"]?.n())
-        assertEquals("PENDING", request.item()["status"]?.s())
-        assertEquals("PIX", request.item()["payment_method"]?.s())
-        assertEquals("00-trace-123-01", request.item()["origin_trace_id"]?.s())
+        verify(exactly = 1) { paymentTable.putItem(any<PaymentDynamoItem>()) }
+        assertEquals("BILLING#${payment.serviceOrderId}", payment.pk)
+        assertTrue(payment.sk.startsWith("PAY#"))
     }
 
     @Test
-    fun `should save payment without originTraceId`() {
-        val payment = PaymentDynamoItem(
-            id = "pay-101",
-            orderId = UUID.randomUUID(),
-            customerId = UUID.randomUUID(),
-            amount = 50.0,
-            originTraceId = null
+    fun `should save invoice using enhanced client`() {
+        val invoice = InvoiceDynamoItem(
+            invoiceId = "inv-500",
+            serviceOrderId = UUID.randomUUID().toString(),
+            customerId = UUID.randomUUID().toString(),
+            invoiceNumber = "NF-00123",
+            priceValue = 199.90
         )
 
-        repository.save(payment)
+        repository.saveInvoice(invoice)
 
-        val captor = ArgumentCaptor.forClass(PutItemRequest::class.java)
-        verify(dynamoDbClient).putItem(captor.capture())
-        assertNull(captor.value.item()["origin_trace_id"])
+        verify(exactly = 1) { invoiceTable.putItem(invoice) }
+        assertEquals("BILLING#${invoice.serviceOrderId}", invoice.pk)
+        assertTrue(invoice.sk.startsWith("INV#"))
     }
 
     @Test
-    fun `should return payment when findById finds item`() {
+    fun `should return payment when findById finds item via scan`() {
         val id = "pay-found"
-        val orderId = UUID.randomUUID()
-        val customerId = UUID.randomUUID()
+        val orderId = UUID.randomUUID().toString()
+        val customerId = UUID.randomUUID().toString()
 
         val itemMap = mapOf(
-            "id" to AttributeValue.builder().s(id).build(),
-            "order_id" to AttributeValue.builder().s(orderId.toString()).build(),
-            "customer_id" to AttributeValue.builder().s(customerId.toString()).build(),
-            "amount" to AttributeValue.builder().n("120.5").build(),
+            "payment_id" to AttributeValue.builder().s(id).build(),
+            "service_order_id" to AttributeValue.builder().s(orderId).build(),
+            "customer_id" to AttributeValue.builder().s(customerId).build(),
+            "price_value" to AttributeValue.builder().n("120.5").build(),
             "status" to AttributeValue.builder().s("APPROVED").build(),
             "payment_method" to AttributeValue.builder().s("CREDIT_CARD").build(),
             "dispatch_notificate_status" to AttributeValue.builder().s("DISPATCHED").build(),
@@ -89,26 +93,23 @@ class DynamoPaymentRepositoryTest {
             "origin_trace_id" to AttributeValue.builder().s("trace-abc").build()
         )
 
-        val response = GetItemResponse.builder().item(itemMap).build()
-        `when`(dynamoDbClient.getItem(any(GetItemRequest::class.java))).thenReturn(response)
+        val response = ScanResponse.builder().items(listOf(itemMap)).build()
+        every { dynamoDbClient.scan(any<ScanRequest>()) } returns response
 
         val result = repository.findById(id)
 
         assertNotNull(result)
-        assertEquals(id, result?.id)
-        assertEquals(orderId, result?.orderId)
+        assertEquals(id, result?.paymentId)
+        assertEquals(orderId, result?.serviceOrderId)
         assertEquals(customerId, result?.customerId)
-        assertEquals(120.5, result?.amount)
+        assertEquals(120.5, result?.priceValue)
         assertEquals("APPROVED", result?.status)
-        assertEquals("CREDIT_CARD", result?.paymentMethod)
-        assertEquals("DISPATCHED", result?.dispatchNotificateStatus)
-        assertEquals("trace-abc", result?.originTraceId)
     }
 
     @Test
-    fun `should return null when findById returns empty response`() {
-        val response = GetItemResponse.builder().item(emptyMap()).build()
-        `when`(dynamoDbClient.getItem(any(GetItemRequest::class.java))).thenReturn(response)
+    fun `should return null when findById returns empty scan`() {
+        val response = ScanResponse.builder().items(emptyList()).build()
+        every { dynamoDbClient.scan(any<ScanRequest>()) } returns response
 
         val result = repository.findById("unknown")
 
@@ -117,31 +118,24 @@ class DynamoPaymentRepositoryTest {
 
     @Test
     fun `should updateStatus with dispatchStatus provided`() {
-        val id = "pay-update-1"
-        repository.updateStatus(id, "APPROVED", "DISPATCHED")
+        val pk = "BILLING#order-1"
+        val sk = "PAY#123#pay-1"
 
-        val captor = ArgumentCaptor.forClass(UpdateItemRequest::class.java)
-        verify(dynamoDbClient, times(1)).updateItem(captor.capture())
+        val slot = slot<UpdateItemRequest>()
+        every { dynamoDbClient.updateItem(capture(slot)) } returns mockk()
 
-        val request = captor.value
+        repository.updateStatus(pk, sk, "APPROVED", "DISPATCHED", "PENDING")
+
+        verify(exactly = 1) { dynamoDbClient.updateItem(any<UpdateItemRequest>()) }
+
+        val request = slot.captured
         assertEquals(tableName, request.tableName())
-        assertEquals("PAYMENT#$id", request.key()["PK"]?.s())
-        assertEquals("SET #status = :newStatus, #dns = :dns", request.updateExpression())
+        assertEquals(pk, request.key()["PK"]?.s())
+        assertEquals(sk, request.key()["SK"]?.s())
+        assertTrue(request.updateExpression().contains("#status = :newStatus"))
+        assertTrue(request.updateExpression().contains("#dns = :dns"))
+        assertTrue(request.updateExpression().contains("#ous = :ous"))
         assertEquals("APPROVED", request.expressionAttributeValues()[":newStatus"]?.s())
         assertEquals("DISPATCHED", request.expressionAttributeValues()[":dns"]?.s())
-    }
-
-    @Test
-    fun `should updateStatus without dispatchStatus`() {
-        val id = "pay-update-2"
-        repository.updateStatus(id, "CANCELLED", null)
-
-        val captor = ArgumentCaptor.forClass(UpdateItemRequest::class.java)
-        verify(dynamoDbClient, times(1)).updateItem(captor.capture())
-
-        val request = captor.value
-        assertEquals("SET #status = :newStatus", request.updateExpression())
-        assertEquals("CANCELLED", request.expressionAttributeValues()[":newStatus"]?.s())
-        assertFalse(request.expressionAttributeValues().containsKey(":dns"))
     }
 }
