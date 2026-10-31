@@ -1,9 +1,12 @@
 package br.com.fiap.repairshop.payment
 
-import br.com.fiap.repairshop.payment.infrastructure.messaging.PaymentOrderInboundEvent
+import br.com.fiap.repairshop.payment.infrastructure.mercadopago.MercadoPagoClient
+import br.com.fiap.repairshop.payment.infrastructure.mercadopago.MercadoPagoPaymentRequest
+import br.com.fiap.repairshop.payment.infrastructure.mercadopago.MercadoPagoPaymentResponse
+import br.com.fiap.repairshop.payment.infrastructure.messaging.OsReadyForPaymentInboundEvent
 import br.com.fiap.repairshop.payment.infrastructure.messaging.PaymentSqsMessenger
 import br.com.fiap.repairshop.payment.infrastructure.persistence.DynamoPaymentRepository
-import br.com.fiap.repairshop.payment.infrastructure.persistence.PaymentDynamoItem
+import br.com.fiap.repairshop.payment.infrastructure.persistence.models.PaymentDynamoItem
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.mockk.*
@@ -19,12 +22,13 @@ class PaymentSqsMessengerTest {
 
     private val sqsClient: SqsClient = mockk(relaxed = true)
     private val repository: DynamoPaymentRepository = mockk(relaxed = true)
+    private val mercadoPagoClient: MercadoPagoClient = mockk(relaxed = true)
     private val objectMapper: ObjectMapper = jacksonObjectMapper()
     private lateinit var messenger: PaymentSqsMessenger
 
-    private val createQueue = "create-payment-queue"
-    private val callbackQueue = "callback-payment-queue"
-    private val notificationQueue = "notification-queue"
+    private val osReadyQueue = "os-ready-for-payment-queue"
+    private val notificationQueue = "payment-notification-queue"
+    private val paymentSuccessQueue = "payment-success-queue"
 
     @BeforeEach
     fun setUp() {
@@ -41,18 +45,19 @@ class PaymentSqsMessengerTest {
         messenger = PaymentSqsMessenger(
             sqsClient = sqsClient,
             paymentRepository = repository,
+            mercadoPagoClient = mercadoPagoClient,
             objectMapper = objectMapper,
-            createPaymentQueue = createQueue,
-            callbackPaymentQueue = callbackQueue,
-            paymentNotificationQueue = notificationQueue
+            osReadyForPaymentQueue = osReadyQueue,
+            paymentNotificationQueue = notificationQueue,
+            paymentSuccessQueue = paymentSuccessQueue
         )
     }
 
     @Test
-    fun `should poll messages from create payment queue and save to repository and delete message`() {
+    fun `should poll messages from os ready queue and save to repository and delete message`() {
         val orderId = UUID.randomUUID()
         val customerId = UUID.randomUUID()
-        val event = PaymentOrderInboundEvent(orderId = orderId, customerId = customerId, amount = 175.50)
+        val event = OsReadyForPaymentInboundEvent(orderId = orderId, customerId = customerId, amount = 175.50)
         val jsonBody = objectMapper.writeValueAsString(event)
 
         val message = Message.builder()
@@ -70,15 +75,23 @@ class PaymentSqsMessengerTest {
         every { sqsClient.receiveMessage(any<ReceiveMessageRequest>()) } returns receiveResponse
         every { sqsClient.deleteMessage(any<DeleteMessageRequest>()) } returns DeleteMessageResponse.builder().build()
 
+        val mpResponse = MercadoPagoPaymentResponse(
+            paymentId = "mp-999",
+            status = "PENDING",
+            qrCode = "pix-code"
+        )
+        every { mercadoPagoClient.createPayment(any<MercadoPagoPaymentRequest>()) } returns mpResponse
+
         val itemSlot = slot<PaymentDynamoItem>()
-        every { repository.save(capture(itemSlot)) } just Runs
+        every { repository.savePayment(capture(itemSlot)) } just Runs
+        every { repository.saveInvoice(any()) } just Runs
 
-        messenger.pollCreatePaymentOrders()
+        messenger.pollOsReadyForPayment()
 
-        verify(exactly = 1) { repository.save(any()) }
-        assertEquals(orderId, itemSlot.captured.orderId)
-        assertEquals(customerId, itemSlot.captured.customerId)
-        assertEquals(175.50, itemSlot.captured.amount)
+        verify(exactly = 1) { repository.savePayment(any()) }
+        assertEquals(orderId.toString(), itemSlot.captured.serviceOrderId)
+        assertEquals(customerId.toString(), itemSlot.captured.customerId)
+        assertEquals(175.50, itemSlot.captured.priceValue)
         assertEquals("PENDING", itemSlot.captured.status)
         assertEquals("00-trace-test-01", itemSlot.captured.originTraceId)
 
@@ -92,40 +105,56 @@ class PaymentSqsMessengerTest {
         every { sqsClient.receiveMessage(any<ReceiveMessageRequest>()) } throws SqsException.builder().message("SQS unavailable").build()
 
         assertDoesNotThrow {
-            messenger.pollCreatePaymentOrders()
+            messenger.pollOsReadyForPayment()
         }
 
-        verify(exactly = 0) { repository.save(any()) }
+        verify(exactly = 0) { repository.savePayment(any()) }
     }
 
     @Test
-    fun `should notify payment success to OS callback and notification queues`() {
-        val payment = PaymentDynamoItem(
-            id = "pay-success-1",
-            orderId = UUID.randomUUID(),
-            customerId = UUID.randomUUID(),
-            amount = 350.0,
-            status = "APPROVED"
-        )
+    fun `should send payment success event to payment-success-queue`() {
+        val orderId = UUID.randomUUID()
+        val paymentId = "pay-success-1"
+        val amount = 350.0
 
         val sentRequests = mutableListOf<SendMessageRequest>()
         every { sqsClient.sendMessage(capture(sentRequests)) } returns SendMessageResponse.builder().build()
 
-        messenger.notifyPaymentSuccess(payment)
+        messenger.sendPaymentSuccessEvent(orderId, paymentId, amount)
 
-        verify(exactly = 2) { sqsClient.sendMessage(any<SendMessageRequest>()) }
-        assertEquals(2, sentRequests.size)
+        verify(exactly = 1) { sqsClient.sendMessage(any<SendMessageRequest>()) }
+        assertEquals(1, sentRequests.size)
 
-        val callbackReq = sentRequests.find { it.queueUrl().contains(callbackQueue) }
-        assertNotNull(callbackReq)
-        assertTrue(callbackReq!!.messageBody().contains("APPROVED"))
-        assertTrue(callbackReq.messageBody().contains(payment.id))
-        assertTrue(callbackReq.messageAttributes().containsKey("traceparent"))
+        val successReq = sentRequests.first()
+        assertTrue(successReq.queueUrl().contains(paymentSuccessQueue))
+        assertTrue(successReq.messageBody().contains("APPROVED"))
+        assertTrue(successReq.messageBody().contains(paymentId))
+        assertTrue(successReq.messageBody().contains("350.0"))
+    }
 
-        val notifReq = sentRequests.find { it.queueUrl().contains(notificationQueue) }
-        assertNotNull(notifReq)
-        assertTrue(notifReq!!.messageBody().contains("APPROVED"))
-        assertTrue(notifReq.messageBody().contains(payment.amount.toString()))
-        assertTrue(notifReq.messageAttributes().containsKey("traceparent"))
+    @Test
+    fun `should send notification event to payment-notification-queue`() {
+        val orderId = UUID.randomUUID()
+        val customerId = UUID.randomUUID()
+        val paymentId = "pay-notif-1"
+
+        val sentRequests = mutableListOf<SendMessageRequest>()
+        every { sqsClient.sendMessage(capture(sentRequests)) } returns SendMessageResponse.builder().build()
+
+        messenger.notifyPaymentStatus(
+            eventType = "ready_for_payment",
+            orderId = orderId,
+            customerId = customerId,
+            paymentId = paymentId,
+            amount = 150.0,
+            status = "PENDING",
+            qrCode = "pix-qr"
+        )
+
+        verify(exactly = 1) { sqsClient.sendMessage(any<SendMessageRequest>()) }
+        val req = sentRequests.first()
+        assertTrue(req.queueUrl().contains(notificationQueue))
+        assertTrue(req.messageBody().contains("ready_for_payment"))
+        assertTrue(req.messageBody().contains("pix-qr"))
     }
 }
