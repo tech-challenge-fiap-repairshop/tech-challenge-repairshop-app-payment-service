@@ -367,6 +367,15 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Ensure IMDSv2 Hop Limit 2 on EKS Worker Nodes
+        run: |
+          CLUSTER="${{ steps.env-target.outputs.cluster_name }}"
+          INSTANCE_IDS=$(aws ec2 describe-instances --region ${{ env.AWS_REGION }} --filters "Name=tag:eks:cluster-name,Values=${CLUSTER}" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text)
+          for ID in $INSTANCE_IDS; do
+            echo "Garantindo http-put-response-hop-limit=2 na instancia $ID..."
+            aws ec2 modify-instance-metadata-options --region ${{ env.AWS_REGION }} --instance-id "$ID" --http-put-response-hop-limit 2 --http-endpoint enabled >/dev/null
+          done
+
       - name: Set up Kubeconfig from Shared EKS Cluster
         run: |
           CLUSTER="${{ steps.env-target.outputs.cluster_name }}"

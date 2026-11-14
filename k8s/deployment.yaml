@@ -65,11 +65,11 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
               ephemeral-storage: "1Gi"
             limits:
               cpu: 500m
-              memory: 512Mi
+              memory: 1Gi
               ephemeral-storage: "2Gi"
           volumeMounts:
             - name: tmp-volume
@@ -82,18 +82,18 @@ spec:
             httpGet:
               path: /actuator/health/readiness
               port: 8080
-            initialDelaySeconds: 25
+            initialDelaySeconds: 45
             periodSeconds: 10
             timeoutSeconds: 3
-            failureThreshold: 3
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: 8080
-            initialDelaySeconds: 45
+            initialDelaySeconds: 90
             periodSeconds: 15
             timeoutSeconds: 3
-            failureThreshold: 3
+            failureThreshold: 4
       volumes:
         - name: tmp-volume
           emptyDir: {}
