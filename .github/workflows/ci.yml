@@ -77,7 +77,7 @@ jobs:
 
       - name: Run Application JAR
         env:
-          SERVER_PORT: "8082"
+          SERVER_PORT: "8080"
           SQS_HEALTH_CHECK_ENABLED: "false"
           AWS_REGION: "us-east-1"
           JAVA_TOOL_OPTIONS: "-Djava.net.preferIPv4Stack=true"
@@ -95,7 +95,7 @@ jobs:
         run: |
           echo "Waiting for application to start..."
           for i in {1..30}; do
-            if curl -s http://localhost:8082/actuator/health | grep -q '"status":"UP"'; then
+            if curl -s http://localhost:8080/actuator/health | grep -q '"status":"UP"'; then
               echo "Post-Build Smoke Test Passed! Application is UP."
               docker stop smoke-jar
               docker rm smoke-jar
@@ -111,7 +111,7 @@ jobs:
           exit 1
 
   # ==========================================================================
-  # STAGE 2 — TEST: Testes unitários + integração + JaCoCo
+  # STAGE 2 — TEST: Testes unitários + integração BDD (Testcontainers) + JaCoCo
   # ==========================================================================
   test:
     name: "🧪 Test"
@@ -180,6 +180,17 @@ jobs:
       - name: Recompile for Sonar binaries
         run: mvn compile -B -ntp -DskipTests
 
+      - name: Trivy SCA Dependency Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'pom.xml'
+          scanners: 'vuln'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
       - name: SonarCloud Scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -206,7 +217,7 @@ jobs:
     if: |
       needs.quality.result == 'success' &&
       github.event_name != 'pull_request' &&
-      (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target_env == 'prd'))
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -227,7 +238,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Determine Target Environment & ECR Repository
+      - name: Determine Target Environment & Ensure ECR Repository
         id: ecr-target
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -240,13 +251,12 @@ jobs:
             TARGET="dev"
           fi
           
-          REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service') && contains(repositoryName, '${TARGET}')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
-          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
-            REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
+          REPO_NAME="payment-service-${TARGET}"
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            echo "Criando repositório ECR '$REPO_NAME'..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --image-scanning-configuration scanOnPush=true --region ${{ env.AWS_REGION }}
           fi
-          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
-            REPO_NAME="payment-service-${TARGET}"
-          fi
+
           echo "target_env=${TARGET}" >> $GITHUB_OUTPUT
           echo "repository_name=${REPO_NAME}" >> $GITHUB_OUTPUT
           echo "Target Environment: ${TARGET}"
@@ -272,21 +282,60 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
+      - name: Run Smoke Test (Start application container)
+        env:
+          SERVER_PORT: "8080"
+          SQS_HEALTH_CHECK_ENABLED: "false"
+          AWS_REGION: "us-east-1"
+          OTEL_TRACES_EXPORTER: "none"
+          OTEL_METRICS_EXPORTER: "none"
+          OTEL_LOGS_EXPORTER: "none"
+          JAVA_TOOL_OPTIONS: "-Djava.net.preferIPv4Stack=true"
+        run: |
+          docker run -d --name smoke-app --network host \
+            -e SERVER_PORT="$SERVER_PORT" \
+            -e SQS_HEALTH_CHECK_ENABLED="$SQS_HEALTH_CHECK_ENABLED" \
+            -e AWS_REGION="$AWS_REGION" \
+            -e OTEL_TRACES_EXPORTER="$OTEL_TRACES_EXPORTER" \
+            -e OTEL_METRICS_EXPORTER="$OTEL_METRICS_EXPORTER" \
+            -e OTEL_LOGS_EXPORTER="$OTEL_LOGS_EXPORTER" \
+            -e JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS" \
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest
+
+      - name: Verify application startup (Actuator Health Check)
+        run: |
+          echo "Waiting for application to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/actuator/health | grep -q '"status":"UP"'; then
+              echo "Smoke Test Passed! Application is UP."
+              docker stop smoke-app
+              docker rm smoke-app
+              exit 0
+            fi
+            echo "Waiting..."
+            sleep 2
+          done
+          echo "Smoke Test Failed! Container logs:"
+          docker logs smoke-app
+          docker stop smoke-app
+          docker rm smoke-app
+          exit 1
+
       - name: Push Docker image to Amazon ECR
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:latest
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-target.outputs.repository_name }}:${{ github.sha }}
 
   # ==========================================================================
-  # STAGE 5 — DEPLOY: Deploy no Kubernetes EKS (Direto pós-merge na Main)
+  # STAGE 5 — DEPLOY: Deploy no Cluster EKS Compartilhado (Namespace: repairshop)
   # ==========================================================================
   deploy:
-    name: "🚀 Deploy to EKS"
+    name: "🚀 Deploy to Shared EKS"
     needs: [docker-build-push]
     if: |
       needs.docker-build-push.result == 'success' &&
       github.event_name != 'pull_request' &&
-      (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target_env == 'prd'))
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -318,31 +367,33 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Kubeconfig from EKS
+      - name: Set up Kubeconfig from Shared EKS Cluster
         run: |
           CLUSTER="${{ steps.env-target.outputs.cluster_name }}"
-          echo "Configuring Kubeconfig for cluster: $CLUSTER..."
+          echo "Configuring Kubeconfig for shared cluster: $CLUSTER..."
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name "$CLUSTER"
 
       - name: Prepare Deployment & Secrets
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MERCADO_PAGO_ACCESS_TOKEN || secrets.MERCADOPAGO_ACCESS_TOKEN }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           ENV_NAME="${{ steps.env-target.outputs.environment }}"
-          
-          REPO_NAME=$(aws ecr describe-repositories --region ${{ env.AWS_REGION }} --query "repositories[?contains(repositoryName, 'payment-service') && contains(repositoryName, '${ENV_NAME}')].repositoryName" --output text 2>/dev/null | tr '\t' '\n' | head -n 1)
-          if [ -z "$REPO_NAME" ] || [ "$REPO_NAME" = "None" ]; then
-            REPO_NAME="payment-service-${ENV_NAME}"
-          fi
+          REPO_NAME="payment-service-${ENV_NAME}"
           
           echo "Using Image: ${ECR_REGISTRY}/${REPO_NAME}:latest"
           sed -i "s|image: .*|image: ${ECR_REGISTRY}/${REPO_NAME}:latest|g" k8s/deployment.yaml
+
+          if [ -n "$MP_ACCESS_TOKEN" ]; then
+            sed -i "s|MERCADO_PAGO_ACCESS_TOKEN: .*|MERCADO_PAGO_ACCESS_TOKEN: ${MP_ACCESS_TOKEN}|g" k8s/secret.yaml
+          fi
 
       - name: Deploy Kubernetes Manifests
         run: |
           ENV_NAME="${{ steps.env-target.outputs.environment }}"
           
-          echo "Garantindo namespace 'repairshop'..."
+          echo "Garantindo namespace compartilhado 'repairshop'..."
           kubectl apply -f k8s/namespace.yaml
           
           echo "Aplicando ConfigMap (${ENV_NAME})..."

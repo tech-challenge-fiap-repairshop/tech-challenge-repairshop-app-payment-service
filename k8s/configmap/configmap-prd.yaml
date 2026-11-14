@@ -8,13 +8,13 @@ metadata:
     env: prd
 data:
   SPRING_APPLICATION_NAME: payment-service
-  SERVER_PORT: "8082"
+  SERVER_PORT: "8080"
   SPRING_PROFILES_ACTIVE: prd
   AWS_REGION: us-east-1
-  DYNAMODB_TABLE_NAME: tb-payment-prd
-  SQS_CREATE_PAYMENT_ORDER_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/create-payment-order-queue-prd
-  SQS_SERVICE_ORDER_EXECUTION_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/service-order-execution-queue-prd
-  SQS_PAYMENT_NOTIFICATION_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/payment-notification-queue-prd
+  DYNAMODB_TABLE_PAYMENT: tb-payment-prd
+  SQS_OS_READY_FOR_PAYMENT: os-ready-for-payment-queue-prd
+  SQS_PAYMENT_NOTIFICATION: payment-notification-queue-prd
+  SQS_PAYMENT_SUCCESS: payment-success-queue-prd
   SQS_HEALTH_CHECK_ENABLED: "true"
   SQS_HEALTH_CHECK_MAX_IDLE: "120"
-  LOGGING_LEVEL_BR_COM_FIAP_REPAIRSHOP_PAYMENT: INFO
+  LOGGING_LEVEL_COM_CAO_REPAIRSHOP_PAYMENT: INFO

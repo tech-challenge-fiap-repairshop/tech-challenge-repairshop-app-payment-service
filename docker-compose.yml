@@ -18,22 +18,22 @@ services:
     build: .
     container_name: payment-service-standalone
     environment:
-      SERVER_PORT: 8082
+      SERVER_PORT: 8080
       AWS_ENDPOINT_URL: http://localstack:4566
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_REGION: us-east-1
       DYNAMODB_TABLE_PAYMENT: tb-payment-dev
-      SQS_QUEUE_CREATE_PAYMENT: create-payment-order-queue-dev
-      SQS_QUEUE_CALLBACK_PAYMENT: callback-payment-order-queue-dev
-      SQS_QUEUE_PAYMENT_NOTIFICATION: payment-notification-queue-dev
+      SQS_OS_READY_FOR_PAYMENT: os-ready-for-payment-queue-dev
+      SQS_PAYMENT_NOTIFICATION: payment-notification-queue-dev
+      SQS_PAYMENT_SUCCESS: payment-success-queue-dev
       # OpenTelemetry
       OTEL_SERVICE_NAME: payment-service
       OTEL_TRACES_EXPORTER: none
       OTEL_METRICS_EXPORTER: prometheus
       OTEL_LOGS_EXPORTER: none
     ports:
-      - "8082:8082"
+      - "8082:8080"
     depends_on:
       localstack:
         condition: service_healthy

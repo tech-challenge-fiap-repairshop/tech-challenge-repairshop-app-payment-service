@@ -30,6 +30,6 @@ RUN chmod 644 /app/app.jar /app/opentelemetry-javaagent.jar
 
 USER springuser
 
-EXPOSE 8082
+EXPOSE 8080
 
 ENTRYPOINT ["java", "-javaagent:/app/opentelemetry-javaagent.jar", "-jar", "/app/app.jar"]
