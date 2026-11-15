@@ -11,6 +11,9 @@ import org.junit.platform.suite.api.Suite
 @IncludeEngines("cucumber")
 @SelectClasspathResource("features")
 @ConfigurationParameter(key = GLUE_PROPERTY_NAME, value = "com.cao.repairshop.payment.bdd")
-@ConfigurationParameter(key = PLUGIN_PROPERTY_NAME, value = "pretty, summary")
+@ConfigurationParameter(
+    key = PLUGIN_PROPERTY_NAME,
+    value = "pretty, summary, html:target/cucumber-reports/cucumber-report.html, json:target/cucumber-reports/cucumber-report.json"
+)
 class CucumberTestRunner
 
