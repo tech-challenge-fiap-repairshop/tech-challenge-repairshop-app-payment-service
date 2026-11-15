@@ -303,13 +303,9 @@
 				<configuration>
 					<excludes>
 						<exclude>**/config/**</exclude>
-						<exclude>**/metrics/**</exclude>
 						<exclude>**/dto/**</exclude>
 						<exclude>**/dtos/**</exclude>
 						<exclude>**/models/**</exclude>
-						<exclude>**/mapper/**</exclude>
-						<exclude>**/messaging/**</exclude>
-						<exclude>**/health/**</exclude>
 						<exclude>**/*Application*</exclude>
 					</excludes>
 				</configuration>
