@@ -144,6 +144,14 @@ jobs:
           path: target/site/jacoco/jacoco.xml
           retention-days: 1
 
+      - name: Upload Cucumber BDD report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cucumber-report
+          path: target/cucumber-reports/
+          retention-days: 7
+
   # ==========================================================================
   # STAGE 3 — QUALITY GATE: SonarCloud analysis
   # ==========================================================================
